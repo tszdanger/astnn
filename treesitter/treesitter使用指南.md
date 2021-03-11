@@ -308,6 +308,308 @@ TSNode ts_node_child_by_field_id(TSNode, TSFieldId);
 
 ### Multi-language Documents
 居然支持混合syntax tree
-对于确定行 是别的语言的 tree，
+对于确定行 是别的语言的 tree，可以有单独的代码来分开解析
 
+    This API allows for great flexibility in how languages can be composed. Tree-sitter is not responsible for mediating the interactions between languages. Instead, you are free to do that using arbitrary application-specific logic.
+
+### Concurrency
+支持多线程
+
+    Internally, copying a syntax tree just entails incrementing an atomic reference count. Conceptually, it provides you a new tree which you can freely query, edit, reparse, or delete on a new thread while continuing to use the original tree on a different thread. Note that individual TSTree instances are not thread safe; you must copy a tree if you want to use it on multiple threads simultaneously.
+
+
+## Other Tree Operations
+### Walking Trees with Tree Cursors
+
+为了更方便，我们选择用 cursor来完成。
+初始化
+```c
+TSTreeCursor ts_tree_cursor_new(TSNode);
+```
+You can move the cursor around the tree:
+```c
+bool ts_tree_cursor_goto_first_child(TSTreeCursor *);
+bool ts_tree_cursor_goto_next_sibling(TSTreeCursor *);
+bool ts_tree_cursor_goto_parent(TSTreeCursor *);
+```
+These methods return true if the cursor successfully moved and false if there was no node to move to.
+
+You can always retrieve the cursor’s current node, as well as the field name that is associated with the current node.
+```c
+TSNode ts_tree_cursor_current_node(const TSTreeCursor *);
+const char *ts_tree_cursor_current_field_name(const TSTreeCursor *);
+TSFieldId ts_tree_cursor_current_field_id(const TSTreeCursor *);
+```
+
+
+## Pattern Matching with Queries
+
+Many code analysis tasks involve searching for patterns in syntax trees. Tree-sitter provides a small declarative language for expressing these patterns and searching for matches. The language is similar to the format of Tree-sitter’s unit test system.
+
+很多代码分析中涉及到了在 语法树上做 模式匹配，我们提供了一种
+dsl来进行这样的语法匹配。
+
+ 这种语言详见https://tree-sitter.github.io/tree-sitter/creating-parsers#the-grammar-dsl
+
+### query
+
+一个query = 许多pattern， 一个pattern 是一个代表很多syntax tree节点的S表达式
+
+一个表达式由两部分组成
+1. node的type
+2. series of 该node的children（optional）
+
+Children can also be omitted. For example, this would match any binary_expression where at least one of child is a string_literal node:
+
+(binary_expression (string_literal))
+
+### Fields
+
+In general, it’s a good idea to make patterns more specific by specifying field names associated with child nodes. You do this by prefixing a child pattern with a field name followed by a colon. For example, this pattern would match an assignment_expression node where the left child is a member_expression whose object is a call_expression.
+```
+(assignment_expression
+  left: (member_expression
+    object: (call_expression)))
+```
+
+### Anonymous Nodes
+The parenthesized syntax for writing nodes only applies to named nodes. To match specific anonymous nodes, you write their name between double quotes. For example, this pattern would match any binary_expression where the operator is != and the right side is null:
+```
+(binary_expression
+  operator: "!="
+  right: (null))
+```
+对于匿名nodes，必须用()再括一层
+
+
+### Capturing Nodes
+
+进行模式匹配时，可能需要根据名字来匹配
+captures允许你把 names和特别的node 关联起来，用@符号
+Capture names are written after the nodes that they refer to, and start with an @ character.
+
+举例子
+
+For example, this pattern would match any assignment of a function to an identifier, and it would associate the name the-function-name with the identifier:
+
+(assignment_expression
+  left: (identifier) @the-function-name
+  right: (function))
+And this pattern would match all method definitions, associating the name the-method-name with the method name, the-class-name with the containing class name:
+
+(class_declaration
+  name: (identifier) @the-class-name
+  body: (class_body
+    (method_definition
+      name: (property_identifier) @the-method-name)))
+
+
+### Quantification Operators
+
+像正则一样写
+
+You can match a repeating sequence of sibling nodes using the postfix + and * repetition operators, which work analogously to the + and * operators in regular expressions. The + operator matches one or more repetitions of a pattern, and the * operator matches zero or more.
+
+For example, this pattern would match a sequence of one or more comments:
+```
+(comment)+
+```
+This pattern would match a class declaration, capturing all of the decorators if any were present:
+```
+(class_declaration
+  (decorator)* @the-decorator
+  name: (identifier) @the-name)
+```
+You can also mark a node as optional using the ? operator. For example, this pattern would match all function calls, capturing a string argument if one was present:
+```
+(call_expression
+  function: (identifier) @the-function
+  arguments: (arguments (string)? @the-string-arg))
+```
+
+
+### Grouping Sibling Nodes
+You can also use parentheses for grouping a sequence of sibling nodes. For example, this pattern would match a comment followed by a function declaration:
+```
+(
+  (comment)
+  (function_declaration)
+)
+```
+Any of the quantification operators mentioned above (+, *, and ?) can also be applied to groups. For example, this pattern would match a comma-separated series of numbers:
+```
+(
+  (number)
+  ("," (number))*
+)
+```
+
+### Alternations
+An alternation is written as a pair of square brackets ([]) containing a list of alternative patterns. This is similar to character classes from regular expressions ([abc] matches either a, b, or c).
+
+For example, this pattern would match a call to either a variable or an object property. In the case of a variable, capture it as @function, and in the case of a property, capture it as @method:
+```
+(call_expression
+  function: [
+    (identifier) @function
+    (member_expression
+      property: (property_identifier) @method)
+  ])
+```
+This pattern would match a set of possible keyword tokens, capturing them as @keyword:
+```
+[
+  "break"
+  "atch"
+  "delete"
+  "else"
+  "for"
+  "function"
+  "if"
+  "return"
+  "try"
+  "while"
+] @keyword
+```
+
+### Wildcard Node
+A wildcard node is represented with an underscore ((_)), it matches any node. This is similar to . in regular expressions.
+
+For example, this pattern would match any node inside a call:
+
+(call (_) @call.inner)
+### Anchors
+The anchor operator, ., is used to constrain the ways in which child patterns are matched. It has different behaviors depending on where it’s placed inside a query.
+
+When . is placed before the first child within a parent pattern, the child will only match when it is the first named node in the parent. For example, the below pattern matches a given array node at most once, assigning the @the-element capture to the first identifier node in the parent array:
+
+(array . (identifier) @the-element)
+Without this anchor, the pattern would match once for every identifier in the array, with @the-element bound to each matched identifier.
+
+Similarly, an anchor placed after a pattern’s last child will cause that child pattern to only match nodes that are the last named child of their parent. The below pattern matches only nodes that are the last named child within a block.
+
+(block (_) @last-expression .)
+Finally, an anchor between two child patterns will cause the patterns to only match nodes that are immediate siblings. The pattern below, given a long dotted name like a.b.c.d, will only match pairs of consecutive identifiers: a, b, b, c, and c, d.
+
+(dotted_name
+  (identifier) @prev-id
+  .
+  (identifier) @next-id)
+Without the anchor, non-consecutive pairs like a, c and b, d would also be matched.
+
+The restrictions placed on a pattern by an anchor operator ignore anonymous nodes.
+
+### Predicates
+You can also specify arbitrary metadata and conditions associed with a pattern by adding predicate S-expressions anywhere within your pattern. Predicate S-expressions start with a predicate name beginning with a # character. After that, they can contain an arbitrary number of @-prefixed capture names or strings.
+
+For example, this pattern would match identifier whose names is written in SCREAMING_SNAKE_CASE:
+
+(
+  (identifier) @constant
+  (#match? @constant "^[A-Z][A-Z_]+")
+)
+And this pattern would match key-value pairs where the value is an identifier with the same name as the key:
+
+(
+  (pair
+    key: (property_identifier) @key-name
+    value: (identifier) @value-name)
+  (#eq? @key-name @value-name)
+)
+Note - Predicates are not handled directly by the Tree-sitter C library. They are just exposed in a structured form so that higher-level code can perform the filtering. However, higher-level bindings to Tree-sitter like the Rust crate or the WebAssembly binding implement a few common predicates like #eq? and #match?.
+
+
+## Static Node Types
+
+
+对于静态类型语言，提供了一个 node-types.json来做。
+
+关于这部分的应用
+    You can use this data to generate type declarations in statically-typed programming languages. For example, GitHub’s Semantic uses these node types files to generate Haskell data types for every possible syntax node, which allows for code analysis algorithms to be structurally verified by the Haskell type system.
+
+### Basic Info
+Every object in this array has these two entries:
+
+"type" - A string that indicates which grammar rule the node represents. This corresponds to the ts_node_type function described above. 看属于哪一部分的语法规则
+
+"named" - A boolean that indicates whether this kind of node corresponds to a rule name in the grammar or just a string literal. See above for more info. 布尔型，是规则名或者只是简单的string
+
+Examples:
+```
+{
+  "type": "string_literal",
+  "named": true
+}
+{
+  "type": "+",
+  "named": false
+}
+```
+Together, these two fields constitute a unique identifier for a node type; no two top-level objects in the node-types.json should have the same values for both "type" and "named".
+
+### Internal Nodes
+Many syntax nodes can have children. The node type object describes the possible children that a node can have using the following entries:
+
+一个nodetype对象可能会有以下两点：
+
+"fields" - An object that describes the possible fields that the node can have. The keys of this object are field names, and the values are child type objects, described below.
+
+其中key是 field names, values是child type
+
+"children" - Another child type object that describes all of the node’s possible named children without fields.
+
+A child type object describes a set of child nodes using the following entries:
+
+一个child对象 会用以下三个key来描述一些node。
+
+"required" - A boolean indicating whether there is always at least one node in this set.
+
+"multiple" - A boolean indicating whether there can be multiple nodes in this set.
+
+"types"- An array of objects that represent the possible types of nodes in this set. Each object has two keys: "type" and "named", whose meanings are described above.
+Example with fields:
+
+### Supertype Nodes
+
+In Tree-sitter grammars, there are usually certain rules that represent abstract categories of syntax nodes (e.g. “expression”, “type”, “declaration”). In the grammar.js file, these are often written as hidden rules whose definition is a simple choice where each member is just a single symbol.
+
+Normally, hidden rules are not mentioned in the node types file, since they don’t appear in the syntax tree. But if you add a hidden rule to the grammar’s supertypes list, then it will show up in the node types file, with the following special entry:
+
+"subtypes" - An array of objects that specify the types of nodes that this ‘supertype’ node can wrap.
+Example:
+```
+{
+  "type": "_declaration",
+  "named": true,
+  "subtypes": [
+    { "type": "class_declaration", "named": true },
+    { "type": "function_declaration", "named": true },
+    { "type": "generator_function_declaration", "named": true },
+    { "type": "lexical_declaration", "named": true },
+    { "type": "variable_declaration", "named": true }
+  ]
+}
+```
+Supertype nodes will also appear elsewhere in the node types file, as children of other node types, in a way that corresponds with how the supertype rule was used in the grammar. This can make the node types much shorter and easier to read, because a single supertype will take the place of multiple subtypes.
+
+Example:
+```
+{
+  "type": "export_statement",
+  "named": true,
+  "fields": {
+    "declaration": {
+      "multiple": false,
+      "required": false,
+      "types": [{ "type": "_declaration", "named": true }]
+    },
+    "source": {
+      "multiple": false,
+      "required": false,
+      "types": [{ "type": "string", "named": true }]
+    }
+  }
+}
+
+```
 
